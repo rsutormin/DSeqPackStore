@@ -576,7 +576,8 @@ pub use segment_compression::{
     decompress_segment_with_marker,
 };
 pub use splitters::{
-    determine_splitters, determine_splitters_streaming, determine_splitters_streaming_first_sample,
+    determine_fixed_splitters_streaming, determine_splitters, determine_splitters_streaming,
+    determine_splitters_streaming_first_sample, SplitterCandidates,
     find_candidate_kmers_multi, is_hard_contig, is_splitter, two_pass_splitter_discovery,
 };
 pub use worker::create_agc_archive;

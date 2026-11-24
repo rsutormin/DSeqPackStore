@@ -1,7 +1,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use dseqpackstore::common::archive::sync_file as sync;
 use dseqpackstore::{
-    determine_splitters_streaming, Decompressor, DecompressorConfig, GenomeIO,
+    Decompressor, DecompressorConfig, GenomeIO, SplitterCandidates,
     StreamingQueueCompressor, StreamingQueueConfig, CNV_NUM,
 };
 use std::{
@@ -17,14 +17,22 @@ mod local_store;
 
 type ProfileState = (usize, bool, Vec<u64>);
 
-fn encode(output: &Path, previous: Option<&Path>, input: &Path, external_packs: bool, auto_profile: bool, single_profile: bool) -> Result<Option<ProfileState>> {
+fn encode(
+    output: &Path,
+    previous: Option<&Path>,
+    input: &Path,
+    external_packs: bool,
+    auto_profile: bool,
+    single_profile: bool,
+    candidates: SplitterCandidates,
+) -> Result<Option<ProfileState>> {
     let config = StreamingQueueConfig { num_threads: 1, verbosity: 0, ..Default::default() };
     let mut writer = if let Some(source) = previous.filter(|_| auto_profile) {
-        StreamingQueueCompressor::append_suffix_auto(output, source, config, input)?
+        StreamingQueueCompressor::append_suffix_auto_with_candidates(output, source, config, input, candidates)?
     } else if let Some(source) = previous {
         StreamingQueueCompressor::append_suffix(output, source, config)?
     } else {
-        let (splitters, _, _) = determine_splitters_streaming(input, config.k, config.segment_size)?;
+        let splitters = candidates.discover(input, config.k, config.segment_size)?;
         let mut writer = StreamingQueueCompressor::with_splitters(output, config, splitters)?;
         writer.enable_append_checkpoint();
         writer.record_initial_founder(input)?;
@@ -77,7 +85,13 @@ struct Publication {
     profile: Option<ProfileState>,
 }
 
-fn publish(root: &Path, input: &Path, request_external_packs: bool, single_profile: bool) -> Result<Publication> {
+fn publish(
+    root: &Path,
+    input: &Path,
+    request_external_packs: bool,
+    single_profile: bool,
+    candidates: SplitterCandidates,
+) -> Result<Publication> {
     let start = Instant::now();
     let archive = root.join("MHC-10.agc");
     let directory = File::open(root)?;
@@ -102,7 +116,7 @@ fn publish(root: &Path, input: &Path, request_external_packs: bool, single_profi
         Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
         _ => {}
     }
-    let profile = encode(&staged, (previous != 0).then_some(archive.as_path()), input, external_packs, true, single_profile)?;
+    let profile = encode(&staged, (previous != 0).then_some(archive.as_path()), input, external_packs, true, single_profile, candidates)?;
     if external_packs {
         sync(&File::open(root.join("blocks"))?)?;
     }
@@ -162,24 +176,38 @@ fn extract(archive: &Path, directory: &Path) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<_> = env::args_os().skip(1).collect();
+    let mut args: Vec<_> = env::args_os().skip(1).collect();
+    let candidates = match args.first().and_then(|arg| arg.to_str())
+        .and_then(|arg| arg.strip_prefix("--splitter-candidates="))
+    {
+        Some("sorted") => {
+            args.remove(0);
+            SplitterCandidates::Sorted
+        }
+        Some("hash") => {
+            args.remove(0);
+            SplitterCandidates::Hash
+        }
+        Some(value) => bail!("Unknown splitter candidate strategy: {value}; expected sorted or hash"),
+        None => SplitterCandidates::default(),
+    };
     rayon::ThreadPoolBuilder::new().num_threads(1).build_global()?;
     match args.as_slice() {
-        [mode, out, input] if mode == "create" => encode(Path::new(out), None, Path::new(input), false, false, false).map(|_| ()),
+        [mode, out, input] if mode == "create" => encode(Path::new(out), None, Path::new(input), false, false, false, candidates).map(|_| ()),
         [mode, source, out, input] if mode == "append" => {
             let source = Path::new(source);
             ensure!(!source.with_file_name(BLOCK_FORMAT).is_file(),
                 "Use publish to extend a store with external packs");
-            encode(Path::new(out), Some(source), Path::new(input), false, false, false).map(|_| ())
+            encode(Path::new(out), Some(source), Path::new(input), false, false, false, candidates).map(|_| ())
         }
         [mode, root, input] if mode == "publish" || mode == "publish-blocks" => {
-            let result = publish(Path::new(root), Path::new(input), mode == "publish-blocks", false)?;
+            let result = publish(Path::new(root), Path::new(input), mode == "publish-blocks", false, candidates)?;
             println!("{},{},{},{},{}", result.version, result.encoded_s, result.publish_s,
                 result.delta_bytes, result.archive_bytes);
             Ok(())
         }
         [mode, root, inputs @ ..] if mode == "store-publish" && !inputs.is_empty() => {
-            local_store::publish_inputs(Path::new(root), inputs.iter().map(Path::new))
+            local_store::publish_inputs(Path::new(root), inputs.iter().map(Path::new), candidates)
         }
         [mode, root] if mode == "store-recover" => local_store::recover_store(Path::new(root)),
         [mode, root, directory] if mode == "store-extract" => {
@@ -187,6 +215,6 @@ fn main() -> Result<()> {
         }
         [mode, root] if mode == "recover" => recover(Path::new(root)).map(|_| ()),
         [mode, archive, directory] if mode == "extract" => extract(Path::new(archive), Path::new(directory)),
-        _ => bail!("usage: ragc_delta create OUT FASTA | append SOURCE SUFFIX FASTA | publish DIR FASTA | publish-blocks DIR FASTA | recover DIR | extract ARCHIVE DIR | store-publish DIR FASTA... | store-recover DIR | store-extract DIR OUT"),
+        _ => bail!("usage: ragc_delta [--splitter-candidates=sorted|hash] create OUT FASTA | append SOURCE SUFFIX FASTA | publish DIR FASTA | publish-blocks DIR FASTA | recover DIR | extract ARCHIVE DIR | store-publish DIR FASTA... | store-recover DIR | store-extract DIR OUT"),
     }
 }

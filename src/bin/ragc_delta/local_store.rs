@@ -1,4 +1,4 @@
-use super::{extract, publish, sync, truncate_archive};
+use super::{extract, publish, sync, truncate_archive, SplitterCandidates};
 use anyhow::{ensure, Context, Result};
 use dseqpackstore::profile_index::SplitterIndex;
 use dseqpackstore::{GenomeIO, StreamingQueueCompressor, StreamingQueueConfig};
@@ -92,7 +92,7 @@ impl<'a> Store<'a> {
         Ok(())
     }
 
-    fn add(&mut self, index: &mut SplitterIndex, input: &Path) -> Result<()> {
+    fn add(&mut self, index: &mut SplitterIndex, input: &Path, candidates: SplitterCandidates) -> Result<()> {
         let start = Instant::now();
         let sample = input.file_stem().and_then(|s| s.to_str()).context("Invalid sample name")?;
         ensure!(!self.catalog.samples.contains_key(sample), "Sample already exists: {sample}");
@@ -129,7 +129,7 @@ impl<'a> Store<'a> {
             fs::create_dir(&target)?;
             sync(&File::open(self.root)?)?;
         }
-        let result = publish(&target, input, new_profile, true)?;
+        let result = publish(&target, input, new_profile, true, candidates)?;
         let (founder_length, expanded, splitters) = result.profile.context("Missing profile state")?;
         if let Some(previous) = self.catalog.profiles.get(&name) {
             let new_keys: Vec<_> = splitters.iter().copied()
@@ -172,14 +172,18 @@ fn write_atomic(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     sync(&File::open(root)?)
 }
 
-pub(super) fn publish_inputs<'a>(root: &Path, inputs: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+pub(super) fn publish_inputs<'a>(
+    root: &Path,
+    inputs: impl IntoIterator<Item = &'a Path>,
+    candidates: SplitterCandidates,
+) -> Result<()> {
     let mut store = Store::open(root, true)?;
     let mut index = SplitterIndex::default();
     for (name, profile) in &store.catalog.profiles {
         index.add_profile(name.clone(), &profile.splitters);
     }
     for input in inputs {
-        store.add(&mut index, input)?;
+        store.add(&mut index, input, candidates)?;
     }
     Ok(())
 }
@@ -219,13 +223,13 @@ mod tests {
         }
         fs::write(&original, &fasta)?;
         fs::write(&next, &fasta)?;
-        publish_inputs(&root, [&original as &Path])?;
+        publish_inputs(&root, [&original as &Path], SplitterCandidates::Sorted)?;
 
         let shard = root.join("p0001");
         let committed_head = fs::read(shard.join("HEAD"))?;
         let committed_length = fs::metadata(shard.join("MHC-10.agc"))?.len();
         write_atomic(&root, PENDING, b"p0001")?;
-        let unpublished = publish(&shard, &next, false, true)?;
+        let unpublished = publish(&shard, &next, false, true, SplitterCandidates::Sorted)?;
         assert_eq!(unpublished.version, 2);
         assert!(unpublished.archive_bytes > committed_length);
         recover_store(&root)?;
@@ -239,7 +243,7 @@ mod tests {
         assert_eq!(fs::read(before.join("original.fa"))?, fasta);
         assert!(!before.join("next.fa").exists());
 
-        publish_inputs(&root, [&next as &Path])?;
+        publish_inputs(&root, [&next as &Path], SplitterCandidates::Hash)?;
         // A crash after publishing the catalog leaves a harmless pending marker.
         write_atomic(&root, PENDING, b"p0001")?;
         let after = workspace.path().join("after");
@@ -247,7 +251,7 @@ mod tests {
         extract_store(&root, &after)?;
         assert_eq!(fs::read(after.join("original.fa"))?, fasta);
         assert_eq!(fs::read(after.join("next.fa"))?, fasta);
-        assert!(publish_inputs(&root, [&next as &Path]).is_err());
+        assert!(publish_inputs(&root, [&next as &Path], SplitterCandidates::Hash).is_err());
         Ok(())
     }
 

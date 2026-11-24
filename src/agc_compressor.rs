@@ -1738,12 +1738,25 @@ impl StreamingQueueCompressor {
 
     /// Resume a checkpointed archive using its initial profile.
     pub fn append_suffix(output: &Path, source: &Path, config: StreamingQueueConfig) -> Result<Self> {
-        Self::resume(output, source, config, None)
+        Self::resume(output, source, config, None, crate::SplitterCandidates::default())
     }
 
     /// Resume a checkpointed archive and select or expand a profile for the input FASTA.
     pub fn append_suffix_auto(output: &Path, source: &Path, config: StreamingQueueConfig, input: &Path) -> Result<Self> {
-        Self::resume(output, source, config, Some(input))
+        Self::append_suffix_auto_with_candidates(
+            output, source, config, input, crate::SplitterCandidates::default(),
+        )
+    }
+
+    /// Resume an automatic append with an explicit lookup strategy for new profiles.
+    pub fn append_suffix_auto_with_candidates(
+        output: &Path,
+        source: &Path,
+        config: StreamingQueueConfig,
+        input: &Path,
+        candidates: crate::SplitterCandidates,
+    ) -> Result<Self> {
+        Self::resume(output, source, config, Some(input), candidates)
     }
 
     /// Return the routing data for a single-profile publication.
@@ -1782,7 +1795,13 @@ impl StreamingQueueCompressor {
         Ok(!keys.is_empty())
     }
 
-    fn resume(output: &Path, source: &Path, config: StreamingQueueConfig, input: Option<&Path>) -> Result<Self> {
+    fn resume(
+        output: &Path,
+        source: &Path,
+        config: StreamingQueueConfig,
+        input: Option<&Path>,
+        candidates: crate::SplitterCandidates,
+    ) -> Result<Self> {
         anyhow::ensure!(!config.adaptive_mode && config.fallback_frac == 0.0, "Checkpoint append requires fixed splitters");
         let mut reader = Archive::new_reader();
         reader.open(source)?;
@@ -1841,7 +1860,7 @@ impl StreamingQueueCompressor {
             profile
         } else {
             let input = input.context("Missing initial splitter profile")?;
-            let (splitters, _, _) = crate::determine_splitters_streaming(input, config.k, config.segment_size)?;
+            let splitters = candidates.discover(input, config.k, config.segment_size)?;
             checkpoint.founders.insert(name.clone(), Founder::new(&contigs, &splitters, config.k));
             let missing = SegmentGroupKey { kmer_front: MISSING_KMER, kmer_back: MISSING_KMER };
             SplitterProfile {

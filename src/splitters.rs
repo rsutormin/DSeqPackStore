@@ -130,51 +130,7 @@ pub fn determine_splitters_streaming(
     k: usize,
     segment_size: usize,
 ) -> Result<(AHashSet<u64>, AHashSet<u64>, AHashSet<u64>)> {
-    // Pass 1a: Stream through file to collect k-mers from ALL contigs (matching C++ AGC)
-    #[cfg(feature = "verbose_debug")]
-    eprintln!("DEBUG: Pass 1 - Collecting k-mers from reference (streaming)...");
-    let mut all_kmers = Vec::new();
-    let mut reference_sample = String::new();
-
-    {
-        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
-        while let Some((_full_header, sample_name, _contig_name, sequence)) =
-            reader.read_contig_with_sample()?
-        {
-            if !sequence.is_empty() {
-                // Identify first sample#haplotype for logging
-                if reference_sample.is_empty() {
-                    reference_sample = sample_name.clone();
-                    #[cfg(feature = "verbose_debug")]
-                    eprintln!(
-                        "DEBUG: Collecting k-mers from ALL contigs (first sample: {})",
-                        reference_sample
-                    );
-                }
-
-                // FIXED: Collect k-mers from ALL contigs (matching C++ AGC)
-                // C++ AGC's determine_splitters() processes all contigs in reference file
-                let contig_kmers = enumerate_kmers(&sequence, k);
-                all_kmers.extend(contig_kmers);
-            }
-        }
-    }
-
-    #[cfg(feature = "verbose_debug")]
-    eprintln!(
-        "DEBUG: Collected {} k-mers (with duplicates)",
-        all_kmers.len()
-    );
-    #[cfg(feature = "verbose_debug")]
-    eprintln!(
-        "DEBUG: Vec memory usage: ~{} MB",
-        all_kmers.len() * 8 / 1_000_000
-    );
-
-    // Pass 1b: Sort and identify duplicates/singletons
-    #[cfg(feature = "verbose_debug")]
-    eprintln!("DEBUG: Sorting k-mers...");
-    all_kmers.radix_sort_unstable();
+    let mut all_kmers = sorted_fasta_kmers(fasta_path, k)?;
 
     // Extract duplicates before removing them
     let mut duplicates = AHashSet::new();
@@ -208,35 +164,67 @@ pub fn determine_splitters_streaming(
         candidates.len()
     );
 
-    // Pass 2: Stream through file again to find actually-used splitters from ALL contigs
-    #[cfg(feature = "verbose_debug")]
-    eprintln!("DEBUG: Pass 2 - Finding actually-used splitters (streaming)...");
-    let mut splitters = AHashSet::new();
+    let splitters = select_fasta_splitters(fasta_path, k, segment_size, |key| {
+        candidates.contains(&key)
+    })?;
+    Ok((splitters, candidates, duplicates))
+}
 
-    {
-        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
-        while let Some((_full_header, _sample_name, _contig_name, sequence)) =
-            reader.read_contig_with_sample()?
-        {
-            // FIXED: Process ALL contigs (matching C++ AGC)
-            // C++ AGC's determine_splitters() processes all contigs in reference file
-            if !sequence.is_empty() {
-                let used = find_actual_splitters_in_contig_named(
-                    &sequence,
-                    &_contig_name,
-                    &candidates,
-                    k,
-                    segment_size,
-                );
-                splitters.extend(used);
-            }
+/// Lookup strategy for singleton candidates when creating a fixed splitter profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SplitterCandidates {
+    #[default]
+    Sorted,
+    Hash,
+}
+
+impl SplitterCandidates {
+    /// Discover the splitters used by a new profile.
+    pub fn discover(self, fasta: &Path, k: usize, segment_size: usize) -> Result<AHashSet<u64>> {
+        match self {
+            Self::Sorted => determine_fixed_splitters_streaming(fasta, k, segment_size),
+            Self::Hash => Ok(determine_splitters_streaming(fasta, k, segment_size)?.0),
         }
     }
+}
 
-    #[cfg(feature = "verbose_debug")]
-    eprintln!("DEBUG: {} actually-used splitters", splitters.len());
+/// Select fixed splitters without building a hash table of all singleton k-mers.
+pub fn determine_fixed_splitters_streaming(
+    fasta_path: &Path,
+    k: usize,
+    segment_size: usize,
+) -> Result<AHashSet<u64>> {
+    let mut candidates = sorted_fasta_kmers(fasta_path, k)?;
+    remove_non_singletons(&mut candidates, 0);
+    select_fasta_splitters(fasta_path, k, segment_size, |key| {
+        candidates.binary_search(&key).is_ok()
+    })
+}
 
-    Ok((splitters, candidates, duplicates))
+fn sorted_fasta_kmers(fasta_path: &Path, k: usize) -> Result<Vec<u64>> {
+    let mut all_kmers = Vec::new();
+    let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
+    while let Some((_, sequence)) = reader.read_contig_converted()? {
+        all_kmers.extend(enumerate_kmers(&sequence, k));
+    }
+    all_kmers.radix_sort_unstable();
+    Ok(all_kmers)
+}
+
+fn select_fasta_splitters(
+    fasta_path: &Path,
+    k: usize,
+    segment_size: usize,
+    is_candidate: impl Fn(u64) -> bool,
+) -> Result<AHashSet<u64>> {
+    let mut splitters = AHashSet::new();
+    let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
+    while let Some((contig_name, sequence)) = reader.read_contig_converted()? {
+        splitters.extend(find_actual_splitters_in_contig_named(
+            &sequence, &contig_name, &is_candidate, k, segment_size,
+        ));
+    }
+    Ok(splitters)
 }
 
 /// Build a splitter set from ONLY the first sample in a PanSN file
@@ -349,7 +337,7 @@ pub fn determine_splitters_streaming_first_sample(
                 let used = find_actual_splitters_in_contig_named(
                     &sequence,
                     &_contig_name,
-                    &candidates,
+                    |key| candidates.contains(&key),
                     k,
                     segment_size,
                 );
@@ -370,7 +358,7 @@ pub fn determine_splitters_streaming_first_sample(
 fn find_actual_splitters_in_contig_named(
     contig: &Contig,
     contig_name: &str,
-    candidates: &AHashSet<u64>,
+    is_candidate: impl Fn(u64) -> bool,
     k: usize,
     segment_size: usize,
 ) -> Vec<u64> {
@@ -399,11 +387,11 @@ fn find_actual_splitters_in_contig_named(
                 if kmer_value == 4991190226639519744 || kmer_value == 1518275220618608640 {
                     eprintln!("DEBUG_RAGC_FOUND_KMER: contig={} pos={} kmer={} current_len={} is_candidate={} will_mark={}",
                               contig_name, current_pos, kmer_value, current_len,
-                              candidates.contains(&kmer_value),
-                              current_len >= segment_size && candidates.contains(&kmer_value));
+                              is_candidate(kmer_value),
+                              current_len >= segment_size && is_candidate(kmer_value));
                 }
 
-                if current_len >= segment_size && candidates.contains(&kmer_value) {
+                if current_len >= segment_size && is_candidate(kmer_value) {
                     // This candidate is actually used!
                     #[cfg(feature = "verbose_debug")]
                     eprintln!(
@@ -424,7 +412,7 @@ fn find_actual_splitters_in_contig_named(
 
     // Try to add rightmost candidate k-mer
     for &kmer_value in recent_kmers.iter().rev() {
-        if candidates.contains(&kmer_value) {
+        if is_candidate(kmer_value) {
             // ALWAYS log end-of-contig splitters (not just in verbose mode)
             eprintln!(
                 "RAGC_END_SPLITTER: contig={} kmer={} recent_kmers_len={} pos={}",
@@ -795,6 +783,20 @@ pub fn two_pass_splitter_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_streaming_splitters_match_hash_candidates() -> Result<()> {
+        use std::io::Write;
+
+        let mut fasta = tempfile::NamedTempFile::new()?;
+        fasta.write_all(b">sample#1#first\nAACGTCATGGAANNCCTGTA\n>sample#1#second\nAACGTCACCGAATTAWNN\n")?;
+        let (expected, _, duplicates) = determine_splitters_streaming(fasta.path(), 5, 9)?;
+        assert!(!expected.is_empty());
+        assert!(!duplicates.is_empty());
+        assert_eq!(SplitterCandidates::default().discover(fasta.path(), 5, 9)?, expected);
+        assert_eq!(SplitterCandidates::Hash.discover(fasta.path(), 5, 9)?, expected);
+        Ok(())
+    }
 
     #[test]
     fn test_determine_splitters_simple() {

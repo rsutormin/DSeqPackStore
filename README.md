@@ -70,6 +70,15 @@ writer samples canonical k-mers, looks up candidates in an inverted index, and
 checks their coverage exactly. It creates a new profile if the best existing
 profile covers less than 50% of the input and cannot be expanded.
 
+New profiles use binary search in a sorted vector of singleton k-mers by
+default. To use the hash-table lookup strategy, pass
+`--splitter-candidates=hash` before `store-publish`, `publish`,
+`publish-blocks`, or `create`. Both strategies select the same splitters.
+
+```sh
+target/release/ragc_delta --splitter-candidates=hash store-publish /tmp/dseq-local sample.fa
+```
+
 A profile can be expanded once. The candidate assembly must be at least 30%
 longer than the founder, and matching splitters in a consistent order must
 cover at least 85% of the founder. The writer discovers extra splitters in
