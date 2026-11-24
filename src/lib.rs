@@ -132,6 +132,7 @@ pub mod lz_matcher;
 pub mod memory_bounded_queue;
 pub mod preprocessing;
 pub mod priority_queue;
+pub mod profile_index;
 pub mod segment;
 pub mod segment_buffer;
 pub mod segment_compression;

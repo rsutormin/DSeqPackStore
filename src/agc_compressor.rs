@@ -3,6 +3,7 @@
 
 use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
 use crate::lz_diff::LZDiff;
+use crate::profile_index::SplitterIndex;
 use crate::memory_bounded_queue::MemoryBoundedQueue;
 use crate::segment::{split_at_splitters_with_size, MISSING_KMER};
 use crate::splitters::{determine_splitters, find_new_splitters_for_contig};
@@ -969,10 +970,12 @@ const NO_RAW_GROUPS: u32 = 16;
 /// # Ok(())
 /// # }
 /// ```
-const CHECKPOINT_STREAM: &str = "ragc-append-checkpoint-v1";
+const CHECKPOINT_STREAM: &str = "ragc-append-checkpoint-v2";
+const LEGACY_CHECKPOINT_STREAM: &str = "ragc-append-checkpoint-v1";
+const INITIAL_PROFILE: &str = "default";
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct AppendGroup {
+struct LegacyAppendGroup {
     key: SegmentGroupKey,
     id: u32,
     next_segment: u32,
@@ -982,18 +985,251 @@ struct AppendGroup {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct AppendCheckpoint {
+struct LegacyAppendCheckpoint {
     splitters: Vec<u64>,
-    groups: Vec<AppendGroup>,
+    groups: Vec<LegacyAppendGroup>,
     pairs: BTreeMap<SegmentGroupKey, u32>,
     terminators: BTreeMap<u64, Vec<u64>>,
     next_group: u32,
     next_raw_group: u32,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AppendGroup {
+    profile: Option<String>,
+    key: SegmentGroupKey,
+    id: u32,
+    next_segment: u32,
+    pending_count: usize,
+    raw_placeholder_written: bool,
+    orientation: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SplitterProfile {
+    splitters: Vec<u64>,
+    pairs: BTreeMap<SegmentGroupKey, u32>,
+    terminators: BTreeMap<u64, Vec<u64>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AppendCheckpoint {
+    founders: BTreeMap<String, Founder>,
+    profile_index: SplitterIndex,
+    profiles: BTreeMap<String, SplitterProfile>,
+    groups: Vec<AppendGroup>,
+    next_group: u32,
+    next_raw_group: u32,
+}
+
+const MIN_PROFILE_COVERAGE: f64 = 0.50;
+const MIN_FOUNDER_COVERAGE: f64 = 0.85;
+const MIN_UNCOVERED_REGION: usize = 100_000;
+
+type SplitterCuts = Arc<BTreeMap<String, AHashSet<usize>>>;
+
+fn visit_kmers(contig: &[u8], k: usize, mut visit: impl FnMut(usize, u64)) {
+    let mut kmer = crate::Kmer::new(k as u32, crate::KmerMode::Canonical);
+    for (i, &base) in contig.iter().enumerate() {
+        if base > 3 {
+            kmer.reset();
+            continue;
+        }
+        kmer.insert(base as u64);
+        if kmer.is_full() {
+            visit(i + 1, kmer.data());
+        }
+    }
+}
+
+fn uncovered_regions(
+    bounds: std::ops::Range<usize>, hits: impl IntoIterator<Item = usize>, radius: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut gaps = Vec::new();
+    let mut end = bounds.start;
+    for pos in hits {
+        let start = pos.saturating_sub(radius).max(bounds.start);
+        if start > end {
+            gaps.push(end..start);
+        }
+        end = end.max((pos + radius).min(bounds.end));
+    }
+    if end < bounds.end {
+        gaps.push(end..bounds.end);
+    }
+    gaps
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Founder {
+    contigs: Vec<(usize, Vec<(usize, u64)>)>,
+    length: usize,
+    promoted: bool,
+}
+
+impl Founder {
+    fn new(contigs: &[(String, Contig)], keys: &AHashSet<u64>, k: usize) -> Self {
+        Self {
+            contigs: contigs.iter().map(|(_, seq)| {
+                let mut anchors = Vec::new();
+                visit_kmers(seq, k, |pos, key| {
+                    if keys.contains(&key) {
+                        anchors.push((pos, key));
+                    }
+                });
+                (seq.len(), anchors)
+            }).collect(),
+            length: contigs.iter().map(|(_, seq)| seq.len()).sum(),
+            promoted: false,
+        }
+    }
+
+    fn covered_by(&self, input: &[(String, Contig)], k: usize, radius: usize) -> f64 {
+        let mut hits: ahash::AHashMap<u64, Option<(usize, usize)>> = ahash::AHashMap::new();
+        for &(_, key) in self.contigs.iter().flat_map(|(_, anchors)| anchors) {
+            hits.insert(key, None);
+        }
+        let mut repeated = AHashSet::new();
+        for (index, (_, seq)) in input.iter().enumerate() {
+            visit_kmers(seq, k, |pos, key| {
+                if let Some(hit) = hits.get_mut(&key) {
+                    if hit.replace((index, pos)).is_some() {
+                        repeated.insert(key);
+                    }
+                }
+            });
+        }
+        let mut covered = 0;
+        for (length, anchors) in &self.contigs {
+            let mut by_contig = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+            for &(old_pos, key) in anchors {
+                if !repeated.contains(&key) {
+                    if let Some(&(index, new_pos)) = hits.get(&key).and_then(Option::as_ref) {
+                        by_contig.entry(index).or_default().push((old_pos, new_pos));
+                    }
+                }
+            }
+            let best = by_contig.values().flat_map(|pairs| [true, false].map(|forward| {
+                // Compare coverage of collinear chains in both orientations.
+                let mut chain = vec![0; pairs.len()];
+                for (i, &(old_pos, new_pos)) in pairs.iter().enumerate() {
+                    let start = old_pos.saturating_sub(radius);
+                    let end = (old_pos + radius).min(*length);
+                    chain[i] = end - start;
+                    for (j, &(previous_old, previous_new)) in pairs[..i].iter().enumerate() {
+                        if (forward && previous_new < new_pos) || (!forward && previous_new > new_pos) {
+                            let increment = end.saturating_sub(start.max(previous_old + radius));
+                            chain[i] = chain[i].max(chain[j] + increment);
+                        }
+                    }
+                }
+                chain.into_iter().max().unwrap_or(0)
+            })).max().unwrap_or(0);
+            covered += best;
+        }
+        covered as f64 / self.length.max(1) as f64
+    }
+}
+
+/// Discover splitters only in sufficiently large gaps. Initial cuts are scoped to
+/// these gaps; the published profile indexes the new splitters for future inputs.
+fn discover_extension(
+    contigs: &[(String, Contig)],
+    primary: &[u64],
+    k: usize,
+    segment_size: usize,
+) -> (SplitterCuts, Vec<u64>) {
+    let primary: AHashSet<_> = primary.iter().copied().collect();
+    let mut gaps = Vec::new();
+    for (index, (_, contig)) in contigs.iter().enumerate() {
+        let mut anchors = Vec::new();
+        visit_kmers(contig, k, |end, key| {
+            if primary.contains(&key) {
+                anchors.push(end);
+            }
+        });
+        gaps.extend(
+            uncovered_regions(0..contig.len(), anchors, segment_size / 2)
+                .into_iter()
+                .filter(|gap| gap.len() >= MIN_UNCOVERED_REGION)
+                .map(|gap| (index, gap)),
+        );
+    }
+    let uncovered: usize = gaps.iter().map(|(_, gap)| gap.len()).sum();
+    let total: usize = contigs.iter().map(|(_, seq)| seq.len()).sum();
+    if uncovered == 0 || uncovered < total.div_ceil(20) {
+        return (Arc::default(), Vec::new());
+    }
+
+    let chunks: Vec<_> = gaps
+        .iter()
+        .map(|(index, gap)| contigs[*index].1[gap.clone()].to_vec())
+        .collect();
+    let (mut keys, _, _) = determine_splitters(&chunks, k, segment_size);
+    keys.retain(|key| !primary.contains(key));
+    let mut cuts = BTreeMap::<String, AHashSet<usize>>::new();
+    if !keys.is_empty() {
+        for (index, gap) in gaps {
+            let (header, contig) = &contigs[index];
+            visit_kmers(&contig[gap.clone()], k, |end, key| {
+                if keys.contains(&key) {
+                    cuts.entry(header.clone()).or_default().insert(gap.start + end - 1);
+                }
+            });
+        }
+    }
+    let mut keys: Vec<_> = keys.into_iter().collect();
+    keys.sort_unstable();
+    (Arc::new(cuts), keys)
+}
+
+impl AppendCheckpoint {
+    fn read(reader: &mut Archive) -> Result<Self> {
+        if let Some(stream) = reader.get_stream_id(CHECKPOINT_STREAM) {
+            let (data, _) = reader.get_part_by_id(stream, 0)?;
+            return Ok(bincode::deserialize(&zstd::decode_all(&data[..])?)?);
+        }
+        let stream = reader
+            .get_stream_id(LEGACY_CHECKPOINT_STREAM)
+            .context("Missing append checkpoint")?;
+        let (data, _) = reader.get_part_by_id(stream, 0)?;
+        let old: LegacyAppendCheckpoint = bincode::deserialize(&zstd::decode_all(&data[..])?)?;
+        let name = INITIAL_PROFILE.to_owned();
+        let mut profile_index = SplitterIndex::default();
+        profile_index.add_profile(name.clone(), &old.splitters);
+        Ok(Self {
+            founders: BTreeMap::new(),
+            profile_index,
+            profiles: BTreeMap::from([(name.clone(), SplitterProfile {
+                splitters: old.splitters,
+                pairs: old.pairs,
+                terminators: old.terminators,
+            })]),
+            groups: old.groups.into_iter().map(|group| AppendGroup {
+                profile: (group.id >= NO_RAW_GROUPS).then(|| name.clone()),
+                key: group.key,
+                id: group.id,
+                next_segment: group.next_segment,
+                pending_count: group.pending_count,
+                raw_placeholder_written: group.raw_placeholder_written,
+                orientation: group.orientation,
+            }).collect(),
+            next_group: old.next_group,
+            next_raw_group: old.next_raw_group,
+        })
+    }
+}
+
 pub struct StreamingQueueCompressor {
+    founders: BTreeMap<String, Founder>,
+    added_splitters: Vec<u64>,
     checkpoint_enabled: bool,
     external_packs: bool,
+    profile_name: String,
+    inactive_profiles: BTreeMap<String, SplitterProfile>,
+    inactive_groups: Vec<AppendGroup>,
+    created_profile: bool,
+    profile_index: SplitterIndex,
     queue: Arc<MemoryBoundedQueue<ContigTask>>,
     workers: Vec<JoinHandle<Result<()>>>,
     barrier: Arc<std::sync::Barrier>, // Synchronization barrier for batch boundaries (matches C++ AGC bar.arrive_and_wait())
@@ -1095,6 +1331,7 @@ impl StreamingQueueCompressor {
             Arc::new(Vec::new()),
             Arc::new(AHashSet::new()),
             None,
+            Arc::default(),
         )
     }
 
@@ -1106,6 +1343,7 @@ impl StreamingQueueCompressor {
         ref_singletons: Arc<Vec<u64>>,
         ref_duplicates: Arc<AHashSet<u64>>,
         source: Option<&Path>,
+        extra_cuts: SplitterCuts,
     ) -> Result<Self> {
         let output_path = output_path.as_ref();
         let archive_path = output_path.to_string_lossy().to_string();
@@ -1325,6 +1563,7 @@ impl StreamingQueueCompressor {
             let write_buffer = Arc::clone(&write_buffer);
             let raw_segment_buffers = Arc::clone(&raw_segment_buffers);
             let config = config.clone();
+            let extra_cuts = Arc::clone(&extra_cuts);
 
             let handle = thread::spawn(move || {
                 worker_thread(
@@ -1332,6 +1571,7 @@ impl StreamingQueueCompressor {
                     queue,
                     collection,
                     splitters,
+                    extra_cuts,
                     ref_singletons,
                     ref_duplicates,
                     archive,
@@ -1368,8 +1608,15 @@ impl StreamingQueueCompressor {
         }
 
         Ok(Self {
+            founders: BTreeMap::new(),
+            added_splitters: Vec::new(),
             checkpoint_enabled: source.is_some(),
             external_packs: false,
+            profile_name: INITIAL_PROFILE.into(),
+            inactive_profiles: BTreeMap::new(),
+            inactive_groups: Vec::new(),
+            created_profile: false,
+            profile_index: SplitterIndex::default(),
             queue,
             workers,
             barrier,
@@ -1461,12 +1708,16 @@ impl StreamingQueueCompressor {
             ref_singletons,
             ref_duplicates,
             None,
+            Arc::default(),
         )
     }
 
     /// Enable a checkpoint so this archive can be extended by the native Rust writer.
     pub fn enable_append_checkpoint(&mut self) {
-        self.checkpoint_enabled = true;
+        if !self.checkpoint_enabled {
+            self.checkpoint_enabled = true;
+            self.created_profile = true;
+        }
     }
 
     /// Store open packs as independent frames in files beside the archive.
@@ -1474,18 +1725,141 @@ impl StreamingQueueCompressor {
         self.external_packs = true;
     }
 
-    /// Resume a checkpointed archive and write only the suffix for the next snapshot.
+    /// Save the first sample's splitter positions for future profile expansion.
+    pub fn record_initial_founder(&mut self, input: &Path) -> Result<()> {
+        let mut fasta = crate::GenomeIO::new(std::fs::File::open(input)?);
+        let mut contigs = Vec::new();
+        while let Some(record) = fasta.read_contig_converted()? {
+            contigs.push(record);
+        }
+        self.founders.insert(self.profile_name.clone(), Founder::new(&contigs, &self.splitters, self.config.k));
+        Ok(())
+    }
+
+    /// Resume a checkpointed archive using its initial profile.
     pub fn append_suffix(output: &Path, source: &Path, config: StreamingQueueConfig) -> Result<Self> {
+        Self::resume(output, source, config, None)
+    }
+
+    /// Resume a checkpointed archive and select or expand a profile for the input FASTA.
+    pub fn append_suffix_auto(output: &Path, source: &Path, config: StreamingQueueConfig, input: &Path) -> Result<Self> {
+        Self::resume(output, source, config, Some(input))
+    }
+
+    /// Return the routing data for a single-profile publication.
+    pub fn single_profile_state(&self) -> Result<(usize, bool, Vec<u64>)> {
+        anyhow::ensure!(self.profile_name == INITIAL_PROFILE && self.inactive_profiles.is_empty(),
+            "Profile store must contain exactly one profile");
+        let founder = self.founders.get(INITIAL_PROFILE).context("Missing profile founder")?;
+        let mut splitters: Vec<_> = self.splitters.iter().copied().collect();
+        splitters.extend_from_slice(&self.added_splitters);
+        splitters.sort_unstable();
+        Ok((founder.length, founder.promoted, splitters))
+    }
+
+    /// Check whether the sole profile can be expanded by the input assembly.
+    pub fn can_expand_profile(source: &Path, input: &Path, config: StreamingQueueConfig) -> Result<bool> {
+        let mut reader = Archive::new_reader();
+        reader.open(source)?;
+        let checkpoint = AppendCheckpoint::read(&mut reader)?;
+        let Some(founder) = checkpoint.founders.get(INITIAL_PROFILE) else {
+            return Ok(false);
+        };
+        if founder.promoted || founder.length == 0 {
+            return Ok(false);
+        }
+        let mut fasta = crate::GenomeIO::new(std::fs::File::open(input)?);
+        let mut contigs = Vec::new();
+        while let Some(record) = fasta.read_contig_converted()? {
+            contigs.push(record);
+        }
+        let length: usize = contigs.iter().map(|(_, seq)| seq.len()).sum();
+        let minimum = founder.length.saturating_add(founder.length.saturating_mul(3).div_ceil(10));
+        if length < minimum || founder.covered_by(&contigs, config.k, config.segment_size / 2) < MIN_FOUNDER_COVERAGE {
+            return Ok(false);
+        }
+        let (_, keys) = discover_extension(&contigs, &checkpoint.profiles[INITIAL_PROFILE].splitters, config.k, config.segment_size);
+        Ok(!keys.is_empty())
+    }
+
+    fn resume(output: &Path, source: &Path, config: StreamingQueueConfig, input: Option<&Path>) -> Result<Self> {
         anyhow::ensure!(!config.adaptive_mode && config.fallback_frac == 0.0, "Checkpoint append requires fixed splitters");
         let mut reader = Archive::new_reader();
         reader.open(source)?;
-        let stream = reader.get_stream_id(CHECKPOINT_STREAM).context("Missing append checkpoint")?;
-        let (data, _) = reader.get_part_by_id(stream, 0)?;
-        let checkpoint: AppendCheckpoint = bincode::deserialize(&zstd::decode_all(&data[..])?)?;
-        let compressor = Self::with_splitters_internal(
-            output, config, checkpoint.splitters.into_iter().collect(),
-            Arc::new(Vec::new()), Arc::new(AHashSet::new()), Some(source),
+        let mut checkpoint = AppendCheckpoint::read(&mut reader)?;
+        let mut added_splitters = Vec::new();
+        let mut extra_cuts = Arc::default();
+        let mut contigs = Vec::new();
+        let name = if let Some(input) = input {
+            if !checkpoint.founders.contains_key(INITIAL_PROFILE) {
+                // Legacy checkpoints store one set of splitters and no founder positions.
+                let mut decoder = crate::Decompressor::open(
+                    source.to_str().context("Invalid archive path")?,
+                    crate::DecompressorConfig::default(),
+                )?;
+                if let Some(founder) = decoder.list_samples().first() {
+                    let original = decoder.get_sample(founder)?;
+                    let keys = checkpoint.profiles[INITIAL_PROFILE].splitters.iter().copied().collect();
+                    checkpoint.founders.insert(INITIAL_PROFILE.into(), Founder::new(&original, &keys, config.k));
+                }
+            }
+            let mut fasta = crate::GenomeIO::new(std::fs::File::open(input)?);
+            while let Some(record) = fasta.read_contig_converted()? {
+                contigs.push(record);
+            }
+            let matched = checkpoint.profile_index.select_two_stage(
+                contigs.iter().map(|(_, seq)| seq.as_slice()), config.k, config.segment_size, MIN_PROFILE_COVERAGE,
+            );
+            let total_nt: usize = contigs.iter().map(|(_, seq)| seq.len()).sum();
+            if let Some(candidate) = matched.name.as_ref() {
+                if let Some(founder) = checkpoint.founders.get_mut(candidate) {
+                    let minimum_length = founder.length.saturating_add(founder.length.saturating_mul(3).div_ceil(10));
+                    if !founder.promoted && founder.length > 0 && total_nt >= minimum_length {
+                        let reciprocal = founder.covered_by(&contigs, config.k, config.segment_size / 2);
+                        if reciprocal >= MIN_FOUNDER_COVERAGE {
+                            (extra_cuts, added_splitters) = discover_extension(
+                                &contigs, &checkpoint.profiles[candidate].splitters, config.k, config.segment_size,
+                            );
+                            founder.promoted = !added_splitters.is_empty();
+                            if founder.promoted && config.verbosity > 0 {
+                                eprintln!("Expanded {candidate} with {} splitters (input coverage {:.1}%, founder coverage {:.1}%)",
+                                    added_splitters.len(), matched.coverage * 100.0, reciprocal * 100.0);
+                            }
+                        }
+                    }
+                }
+            }
+            matched.name.filter(|_| matched.coverage >= MIN_PROFILE_COVERAGE || !added_splitters.is_empty())
+                .unwrap_or_else(|| format!("p{:04}", checkpoint.profiles.len() + 1))
+        } else {
+            INITIAL_PROFILE.to_owned()
+        };
+        let profile_name = name.as_str();
+        let existing = checkpoint.profiles.remove(profile_name);
+        let created_profile = existing.is_none();
+        let profile = if let Some(profile) = existing {
+            profile
+        } else {
+            let input = input.context("Missing initial splitter profile")?;
+            let (splitters, _, _) = crate::determine_splitters_streaming(input, config.k, config.segment_size)?;
+            checkpoint.founders.insert(name.clone(), Founder::new(&contigs, &splitters, config.k));
+            let missing = SegmentGroupKey { kmer_front: MISSING_KMER, kmer_back: MISSING_KMER };
+            SplitterProfile {
+                splitters: splitters.into_iter().collect(),
+                pairs: BTreeMap::from([(missing, 0)]),
+                terminators: BTreeMap::new(),
+            }
+        };
+        let mut compressor = Self::with_splitters_internal(
+            output, config, profile.splitters.into_iter().collect(),
+            Arc::new(Vec::new()), Arc::new(AHashSet::new()), Some(source), extra_cuts,
         )?;
+        compressor.founders = checkpoint.founders;
+        compressor.added_splitters = added_splitters;
+        compressor.profile_name = name.clone();
+        compressor.inactive_profiles = checkpoint.profiles;
+        compressor.created_profile = created_profile;
+        compressor.profile_index = checkpoint.profile_index;
         {
             let mut collection = compressor.collection.lock().unwrap();
             let mut writer = compressor.archive.lock().unwrap();
@@ -1505,6 +1879,19 @@ impl StreamingQueueCompressor {
             for old in checkpoint.groups {
                 let delta_name = crate::common::stream_delta_name(version, old.id);
                 let ref_name = crate::common::stream_ref_name(version, old.id);
+                if old.profile.as_deref().is_some_and(|owner| owner != profile_name) {
+                    // Inactive profile data is immutable during this publication.
+                    for name in [&delta_name, &ref_name] {
+                        if let Some(input_id) = reader.get_stream_id(name) {
+                            let id = writer.register_stream(name);
+                            for part in 0..reader.get_num_parts(input_id) {
+                                writer.reuse_part(id, part)?;
+                            }
+                        }
+                    }
+                    compressor.inactive_groups.push(old);
+                    continue;
+                }
                 let delta_id = writer.register_stream(&delta_name);
                 let ref_id = if old.id >= NO_RAW_GROUPS {
                     writer.register_stream(&ref_name)
@@ -1552,8 +1939,8 @@ impl StreamingQueueCompressor {
                 groups.insert(old.key, group);
             }
         }
-        *compressor.map_segments.write().unwrap() = checkpoint.pairs;
-        *compressor.map_segments_terminators.write().unwrap() = checkpoint.terminators;
+        *compressor.map_segments.write().unwrap() = profile.pairs;
+        *compressor.map_segments_terminators.write().unwrap() = profile.terminators;
         compressor.group_counter.store(checkpoint.next_group, Ordering::SeqCst);
         compressor.raw_group_counter.store(checkpoint.next_raw_group, Ordering::SeqCst);
         compressor.buffered_seg_part.ensure_capacity(checkpoint.next_group);
@@ -1640,6 +2027,7 @@ impl StreamingQueueCompressor {
                         queue,
                         collection,
                         splitters,
+                        Arc::default(),
                         ref_singletons,
                         ref_duplicates,
                         archive,
@@ -1918,7 +2306,7 @@ impl StreamingQueueCompressor {
         Ok(())
     }
 
-    pub fn finalize(self) -> Result<()> {
+    pub fn finalize(mut self) -> Result<()> {
         if self.config.verbosity > 0 {
             eprintln!("Finalizing compression...");
         }
@@ -2025,17 +2413,34 @@ impl StreamingQueueCompressor {
             if self.checkpoint_enabled {
                 let orientations = self.reference_orientations.read().unwrap();
                 let mut splitters: Vec<_> = self.splitters.iter().copied().collect();
+                splitters.extend_from_slice(&self.added_splitters);
                 splitters.sort_unstable();
-                checkpoint = Some(AppendCheckpoint {
+                if !self.added_splitters.is_empty() {
+                    self.profile_index.extend_profile(&self.profile_name, &self.added_splitters);
+                }
+                if self.created_profile {
+                    self.profile_index.add_profile(self.profile_name.clone(), &splitters);
+                }
+                let mut profiles = std::mem::take(&mut self.inactive_profiles);
+                profiles.insert(self.profile_name.clone(), SplitterProfile {
                     splitters,
-                    groups: groups.iter().map(|(key, group)| AppendGroup {
-                        key: key.clone(), id: group.group_id, next_segment: group.segments_written,
-                        pending_count: group.pending_deltas.len(),
-                        raw_placeholder_written: group.raw_placeholder_written,
-                        orientation: orientations.get(&group.group_id).copied().unwrap_or(false),
-                    }).collect(),
                     pairs: self.map_segments.read().unwrap().clone(),
                     terminators: self.map_segments_terminators.read().unwrap().clone(),
+                });
+                let mut checkpoint_groups = std::mem::take(&mut self.inactive_groups);
+                checkpoint_groups.extend(groups.iter().map(|(key, group)| AppendGroup {
+                    profile: (group.group_id >= NO_RAW_GROUPS).then(|| self.profile_name.clone()),
+                    key: key.clone(), id: group.group_id, next_segment: group.segments_written,
+                    pending_count: group.pending_deltas.len(),
+                    raw_placeholder_written: group.raw_placeholder_written,
+                    orientation: orientations.get(&group.group_id).copied().unwrap_or(false),
+                }));
+                checkpoint_groups.sort_unstable_by_key(|group| group.id);
+                checkpoint = Some(AppendCheckpoint {
+                    founders: std::mem::take(&mut self.founders),
+                    profile_index: std::mem::take(&mut self.profile_index),
+                    profiles,
+                    groups: checkpoint_groups,
                     next_group: self.group_counter.load(Ordering::SeqCst),
                     next_raw_group: self.raw_group_counter.load(Ordering::SeqCst),
                 });
@@ -3127,10 +3532,9 @@ fn write_reference_immediately(
 
 /// Compute reverse complement of a sequence
 fn reverse_complement_sequence(seq: &[u8]) -> Vec<u8> {
-    use crate::kmer::reverse_complement;
     seq.iter()
         .rev()
-        .map(|&base| reverse_complement(base as u64) as u8)
+        .map(|&base| if base < 4 { 3 - base } else { base })
         .collect()
 }
 
@@ -5188,6 +5592,7 @@ fn worker_thread(
     queue: Arc<MemoryBoundedQueue<ContigTask>>,
     collection: Arc<Mutex<CollectionV3>>,
     splitters: Arc<AHashSet<u64>>,
+    extra_cuts: SplitterCuts,
     ref_singletons: Arc<Vec<u64>>, // For dynamic splitter discovery (sorted)
     ref_duplicates: Arc<AHashSet<u64>>, // For dynamic splitter discovery
     archive: Arc<Mutex<Archive>>,
@@ -5522,6 +5927,10 @@ fn worker_thread(
                 config.k,
                 config.segment_size,
             )
+        } else if let Some(cuts) = extra_cuts.get(&task.contig_name) {
+            crate::segment::split_at_matching_splitters(&task.data, config.k, |pos, key| {
+                cuts.contains(&pos) || splitters.contains(&key)
+            })
         } else {
             // Reference contig or dynamic discovery disabled - use base splitters only
             split_at_splitters_with_size(&task.data, &splitters, config.k, config.segment_size)
@@ -7876,6 +8285,14 @@ fn try_split_segment_with_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_complement_preserves_ambiguous_base_codes() {
+        let sequence = [0, 1, 2, 3, 4, 8, 11, 15];
+        let reversed = reverse_complement_sequence(&sequence);
+        assert_eq!(reversed, [15, 11, 8, 4, 0, 1, 2, 3]);
+        assert_eq!(reverse_complement_sequence(&reversed), sequence);
+    }
 
     #[test]
     fn test_create_compressor() {

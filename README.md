@@ -13,6 +13,36 @@ Build from the project root:
 cargo build --release --locked
 ```
 
+## Local profile store
+
+Use a new or empty directory for the local profile format. A single command can
+publish multiple FASTA files in order. Each file is an independent commit.
+
+```sh
+target/release/ragc_delta store-publish /tmp/dseq-local reference.fa sample.fa
+mkdir -p /tmp/dseq-restored
+target/release/ragc_delta store-extract /tmp/dseq-local /tmp/dseq-restored
+```
+
+Each profile directory contains its own archive, suffixes, external blocks, and
+checkpoint. The top-level `CATALOG` holds committed profile versions, archive
+lengths, splitter sets, and sample names. The writer rebuilds the in-memory
+inverted index when it opens the store and extends it across a batch.
+
+The command records the target profile before it changes that profile and
+publishes the catalog after syncing the data. `store-recover DIR` restores the
+profile archive to the version in the catalog. An interrupted first commit
+is moved to a hidden orphan directory. Old external pack contents remain
+readable up to the published bounds. A retry replaces an unpublished tail
+when it next appends to that pack. Store commands take an exclusive local
+lock and run recovery on open.
+
+For an existing archive, use `extract` with its original reader and replay
+the extracted samples in publication order through `store-publish` into a
+separate directory.
+
+## Single archive commands
+
 Create an empty working directory and publish the reference first. Publish subsequent
 FASTA files into the same directory using one process at a time:
 
@@ -30,8 +60,27 @@ or changed blocks and an index that points to both new and reused blocks. The
 
 Standalone archives can be extracted with `ragc_delta extract ARCHIVE DIR` or stock AGC.
 Incremental writes require the checkpoint stream created by this prototype.
-The prototype uses fixed splitters and assumes a single writer, with readers
-opening the working archive after publication.
+Publication assumes a single writer, with readers opening the working archive
+after publication.
+
+## Splitter profiles
+
+`publish` and `publish-blocks` automatically select a splitter profile. The
+writer samples canonical k-mers, looks up candidates in an inverted index, and
+checks their coverage exactly. It creates a new profile if the best existing
+profile covers less than 50% of the input and cannot be expanded.
+
+A profile can be expanded once. The candidate assembly must be at least 30%
+longer than the founder, and matching splitters in a consistent order must
+cover at least 85% of the founder. The writer discovers extra splitters in
+uncovered intervals of at least 100,000 bases that together account for at
+least 5% of the input assembly. The existing group IDs and reference segments
+remain available to previously written deltas.
+
+New publications write the version 2 append checkpoint. The writer can extend
+archives with version 1 checkpoints and rebuilds their profile index from the
+stored splitters. The `create` and `append` commands use the initial profile
+for fixed-profile encoding.
 
 ## External open packs
 

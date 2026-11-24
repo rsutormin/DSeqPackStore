@@ -10,6 +10,10 @@ A store for normalized DNA contigs that supports insertion, deletion, versioned 
 - The CLI publishes a base archive followed by numbered suffixes. Each suffix
   contains new or changed blocks and an index that also references reused
   blocks. A checkpoint stream stores the information needed to resume encoding.
+- Publications select a splitter profile using a persisted inverted k-mer
+  index and exact coverage checks. A profile can expand once when a longer
+  assembly covers the founder in a consistent splitter order. Expansion
+  adds splitters and preserves existing group IDs and reference segments.
 - Standard archives can be read by stock AGC. Stores created with
   `publish-blocks` keep open packs in separate files beside the archive. The
   writer appends independent zstd frames, and each snapshot records the readable
@@ -20,6 +24,17 @@ A store for normalized DNA contigs that supports insertion, deletion, versioned 
 - A previous snapshot can be reconstructed by replaying the base archive and
   suffixes through that version. External pack files remain available to
   previous snapshots. The current store provides no garbage collection.
+
+## Local profile format
+
+- `store-publish` stores each profile in its own archive with its own suffixes,
+  external blocks, and checkpoint. The versioned catalog records sample
+  assignments, splitter sets, and the committed version and archive length
+  per profile.
+- Publication uses one local lock and a durable pending profile record.
+  The profile data is synchronized before atomic catalog replacement.
+  Recovery follows the catalog and restores the affected profile's archive
+  boundary. Previously committed external pack boundaries remain readable.
 
 ## Target distributed format
 

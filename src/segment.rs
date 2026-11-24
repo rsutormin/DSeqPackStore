@@ -85,6 +85,14 @@ pub fn split_at_splitters_with_size(
     k: usize,
     _min_segment_size: usize,
 ) -> Vec<Segment> {
+    split_at_matching_splitters(contig, k, |_, key| splitters.contains(&key))
+}
+
+pub(crate) fn split_at_matching_splitters(
+    contig: &Contig,
+    k: usize,
+    is_match: impl Fn(usize, u64) -> bool,
+) -> Vec<Segment> {
     let debug = crate::env_cache::debug_segment_coverage();
     if debug {
         eprintln!(
@@ -133,13 +141,13 @@ pub fn split_at_splitters_with_size(
 
                 // DEBUG: Trace positions near end of contig
                 if crate::env_cache::debug_endpos() && pos + 50 >= contig.len() {
-                    let is_splitter = splitters.contains(&kmer_value);
+                    let is_splitter = is_match(pos, kmer_value);
                     let bytes_left = contig.len() - (pos + 1);
                     eprintln!("ENDPOS_TRACE: pos={} kmer={:#x} is_splitter={} bytes_left={} k={} contig_len={}",
                               pos, kmer_value, is_splitter, bytes_left, k, contig.len());
                 }
 
-                if splitters.contains(&kmer_value) {
+                if is_match(pos, kmer_value) {
                     // Comprehensive split logging for debugging
                     if crate::env_cache::trace_all_splits() {
                         let segment_len = (pos + 1) - segment_start;
