@@ -1,5 +1,21 @@
 # DSeqPackStore
 
+I started DSeqPackStore to make it practical to store growing collections of
+genomes. Similar genomes share long stretches of DNA, so the store reuses
+existing blocks and records differences as deltas. This lets each new genome
+be committed without rewriting the entire archive. The long-term goal is a
+distributed store that keeps versioned snapshots and lets readers retrieve a
+contig or a range without unpacking the whole collection.
+
+Assembled Genomes Compressor (AGC) is a tool for compressing collections of
+assembled genomes. It takes advantage of similarities between genomes by
+encoding segments as differences from shared references. That makes it a
+natural starting point for DSeqPackStore. Adding a genome with AGC produces a
+complete new archive file that includes existing compressed blocks. For a
+collection that grows through frequent updates, I want each commit to publish
+only new data and metadata, with versioned snapshots that can share blocks
+across a distributed store, which is not implemented in the original AGC.
+
 This package contains the native Rust AGC codec derived from
 [ragc at 40e5cad](https://github.com/ekg/ragc/tree/40e5cad) and the incremental
 archive writer tested on MHC-10. See [LICENSE](LICENSE) for the upstream license.
